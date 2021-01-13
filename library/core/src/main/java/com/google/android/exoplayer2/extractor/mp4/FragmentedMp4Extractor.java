@@ -55,6 +55,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /** Extracts data from the FMP4 container format. */
 @SuppressWarnings("ConstantField")
@@ -63,6 +64,10 @@ public class FragmentedMp4Extractor implements Extractor {
   /** Factory for {@link FragmentedMp4Extractor} instances. */
   public static final ExtractorsFactory FACTORY =
       () -> new Extractor[] {new FragmentedMp4Extractor()};
+
+  public interface SsAtomCallback {
+    void onTfrfAtom(long startTime, long duration);
+  }
 
   /**
    * Flags controlling the behavior of the extractor. Possible flag values are {@link
@@ -114,6 +119,8 @@ public class FragmentedMp4Extractor implements Extractor {
       new byte[] {-94, 57, 79, 82, 90, -101, 79, 20, -94, 68, 108, 66, 124, 100, -115, -12};
   private static final Format EMSG_FORMAT =
       Format.createSampleFormat(null, MimeTypes.APPLICATION_EMSG, Format.OFFSET_SAMPLE_RELATIVE);
+  private static final byte[] TFRF_UUID =
+      new byte[] { -44, -128, 126, -14, -54, 57, 70, -107, -114, 84, 38, -53, -98, 70, -89, -97 };
 
   // Parser states.
   private static final int STATE_READING_ATOM_HEADER = 0;
@@ -149,6 +156,8 @@ public class FragmentedMp4Extractor implements Extractor {
   private final ArrayDeque<ContainerAtom> containerAtoms;
   private final ArrayDeque<MetadataSampleInfo> pendingMetadataSampleInfos;
   @Nullable private final TrackOutput additionalEmsgTrackOutput;
+
+  private SsAtomCallback ssAtomCallback;
 
   private int parserState;
   private int atomType;
@@ -264,6 +273,10 @@ public class FragmentedMp4Extractor implements Extractor {
     pendingSeekTimeUs = C.TIME_UNSET;
     segmentIndexEarliestPresentationTimeUs = C.TIME_UNSET;
     enterReadingAtomHeaderState();
+  }
+
+  public void setSsAtomCallback(SsAtomCallback cb) {
+    ssAtomCallback = cb;
   }
 
   @Override
@@ -683,7 +696,7 @@ public class FragmentedMp4Extractor implements Extractor {
     return version == 0 ? mehd.readUnsignedInt() : mehd.readUnsignedLongToLong();
   }
 
-  private static void parseMoof(ContainerAtom moof, SparseArray<TrackBundle> trackBundleArray,
+  private void parseMoof(ContainerAtom moof, SparseArray<TrackBundle> trackBundleArray,
       @Flags int flags, byte[] extendedTypeScratch) throws ParserException {
     int moofContainerChildrenSize = moof.containerChildren.size();
     for (int i = 0; i < moofContainerChildrenSize; i++) {
@@ -698,7 +711,7 @@ public class FragmentedMp4Extractor implements Extractor {
   /**
    * Parses a traf atom (defined in 14496-12).
    */
-  private static void parseTraf(ContainerAtom traf, SparseArray<TrackBundle> trackBundleArray,
+  private void parseTraf(ContainerAtom traf, SparseArray<TrackBundle> trackBundleArray,
       @Flags int flags, byte[] extendedTypeScratch) throws ParserException {
     LeafAtom tfhd = traf.getLeafAtomOfType(Atom.TYPE_tfhd);
     TrackBundle trackBundle = parseTfhd(tfhd.data, trackBundleArray);
@@ -1026,20 +1039,41 @@ public class FragmentedMp4Extractor implements Extractor {
     return value;
   }
 
-  private static void parseUuid(ParsableByteArray uuid, TrackFragment out,
+  private void parseUuid(ParsableByteArray uuid, TrackFragment out,
       byte[] extendedTypeScratch) throws ParserException {
     uuid.setPosition(Atom.HEADER_SIZE);
     uuid.readBytes(extendedTypeScratch, 0, 16);
 
-    // Currently this parser only supports Microsoft's PIFF SampleEncryptionBox.
-    if (!Arrays.equals(extendedTypeScratch, PIFF_SAMPLE_ENCRYPTION_BOX_EXTENDED_TYPE)) {
-      return;
+    if (Arrays.equals(extendedTypeScratch, PIFF_SAMPLE_ENCRYPTION_BOX_EXTENDED_TYPE)) {
+        // Except for the extended type, this box is identical to a SENC box. See "Portable encoding of
+        // audio-video objects: The Protected Interoperable File Format (PIFF), John A. Bocharov et al,
+        // Section 5.3.2.1."
+        parseSenc(uuid, 16, out);
+        return;
     }
 
-    // Except for the extended type, this box is identical to a SENC box. See "Portable encoding of
-    // audio-video objects: The Protected Interoperable File Format (PIFF), John A. Bocharov et al,
-    // Section 5.3.2.1."
-    parseSenc(uuid, 16, out);
+    if (Arrays.equals(extendedTypeScratch, TFRF_UUID)) {
+        ParsableByteArray data = uuid;
+        data.setPosition(Atom.HEADER_SIZE+16);
+        int fullAtom = data.readInt();
+        int version = Atom.parseFullAtomVersion(fullAtom);
+
+        int fragmentCount = data.readUnsignedByte();
+        for(int i=0; i<fragmentCount; i++) {
+            long absTime = 0, duration = 0;
+            if(version == 0) {
+                absTime = data.readInt();
+                duration = data.readInt();
+            } else if(version == 1) {
+                absTime = data.readLong();
+                duration = data.readLong();
+            }
+            if(ssAtomCallback != null) {
+                ssAtomCallback.onTfrfAtom(absTime, duration);
+            }
+        }
+        return;
+    }
   }
 
   private static void parseSenc(ParsableByteArray senc, TrackFragment out) throws ParserException {
